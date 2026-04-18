@@ -1,0 +1,110 @@
+name: 'Version Consistency'
+description: 'Verify version strings across multiple JSON manifest files agree within each declared agreement set.'
+author: 'Omar Shahine'
+
+branding:
+  icon: 'check-circle'
+  color: 'green'
+
+inputs:
+  sets:
+    description: |
+      YAML list of agreement sets. Each set has a `name` and a list of
+      `sources` as "file:jq-path" pairs. All sources within a set must
+      resolve to the same version string. Multiple sets are independent.
+
+      Example:
+        sets: |
+          - name: "Claude Code plugin"
+            sources:
+              - .claude-plugin/plugin.json:.version
+              - .claude-plugin/marketplace.json:.plugins[0].version
+          - name: "OpenClaw plugin"
+            sources:
+              - openclaw/package.json:.version
+              - openclaw/openclaw.plugin.json:.version
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Check version consistency
+      shell: bash
+      env:
+        VCA_SETS: ${{ inputs.sets }}
+      run: |
+        python3 - <<'PY'
+        import os, subprocess, sys
+
+        try:
+            import yaml
+        except ImportError:
+            print("error: PyYAML is required (preinstalled on ubuntu-latest)", file=sys.stderr)
+            sys.exit(2)
+
+        raw = os.environ.get("VCA_SETS", "").strip()
+        if not raw:
+            print("error: input `sets` is empty", file=sys.stderr)
+            sys.exit(2)
+
+        try:
+            sets = yaml.safe_load(raw)
+        except yaml.YAMLError as e:
+            print(f"error: input `sets` is not valid YAML: {e}", file=sys.stderr)
+            sys.exit(2)
+
+        if not isinstance(sets, list) or not sets:
+            print("error: input `sets` must be a non-empty YAML list", file=sys.stderr)
+            sys.exit(2)
+
+        fail = False
+        for idx, s in enumerate(sets):
+            if not isinstance(s, dict):
+                print(f"error: set #{idx} must be a mapping with `name` and `sources`", file=sys.stderr)
+                sys.exit(2)
+            name = s.get("name") or f"set #{idx}"
+            sources = s.get("sources") or []
+            if not isinstance(sources, list) or not sources:
+                print(f"error: set {name!r} must have a non-empty `sources` list", file=sys.stderr)
+                sys.exit(2)
+
+            print(f"=== {name} ===")
+            versions = []
+            widest = max(len(str(src).split(":", 1)[0]) for src in sources)
+            for src in sources:
+                src = str(src)
+                file, _, path = src.partition(":")
+                file = file.strip()
+                path = (path or ".version").strip()
+                if not os.path.exists(file):
+                    print(f"  MISSING {file}", file=sys.stderr)
+                    fail = True
+                    continue
+                try:
+                    v = subprocess.check_output(
+                        ["jq", "-r", path, file],
+                        text=True,
+                        stderr=subprocess.PIPE,
+                    ).strip()
+                except FileNotFoundError:
+                    print("error: jq is required but not found", file=sys.stderr)
+                    sys.exit(2)
+                except subprocess.CalledProcessError as e:
+                    print(f"  ERROR reading {path} from {file}: {e.stderr.strip()}", file=sys.stderr)
+                    fail = True
+                    continue
+                print(f"  {file:<{widest}}  {v}")
+                versions.append(v)
+
+            if not versions:
+                print(f"  FAIL: {name} has no readable sources", file=sys.stderr)
+                fail = True
+            elif len(set(versions)) > 1:
+                print(f"  FAIL: {name} versions disagree: {sorted(set(versions))}", file=sys.stderr)
+                fail = True
+            else:
+                print(f"  OK: all agree on {versions[0]}")
+            print()
+
+        sys.exit(1 if fail else 0)
+        PY
